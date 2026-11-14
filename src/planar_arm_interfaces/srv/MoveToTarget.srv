@@ -1,0 +1,18 @@
+# Move the end-effector to a Cartesian target (x, y) in the arm's base frame.
+#
+# The controller runs IK, plans a smooth joint-space trajectory from the
+# current commanded state, and starts executing it immediately (a new request
+# pre-empts the active trajectory smoothly).
+
+float64 x
+float64 y
+float64 duration        # requested duration [s]; 0 = auto from vel/accel limits
+---
+bool success            # true if a valid trajectory was planned and started
+bool projected          # true if the target was outside the workspace and was
+                        # projected onto the reachable boundary
+float64 goal_x          # Cartesian point actually being moved to
+float64 goal_y
+float64[] joint_goal    # goal joint angles [rad]
+float64 duration        # planned trajectory duration [s]
+string message          # human-readable explanation (shown in the GUI)
