@@ -11,7 +11,11 @@
   <maintainer email="hr@kineshia.in">Kineshia Robotics</maintainer>
   <license>Proprietary — for evaluation use only</license>
 
+  <depend>planar_arm_interfaces</depend>
+
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
