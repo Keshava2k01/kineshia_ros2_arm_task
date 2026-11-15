@@ -4,6 +4,7 @@ controller_node.py  —  owns the arm state, plans and executes trajectories.
 
 Interfaces
     Publishes  /joint_states    sensor_msgs/JointState   at publish_rate_hz
+    Publishes  /controller_status planar_arm_interfaces/msg/ControllerStatus @ 10 Hz
     Service    /move_to_target  planar_arm_interfaces/srv/MoveToTarget
 
 Parameters
@@ -39,6 +40,7 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
+from planar_arm_interfaces.msg import ControllerStatus
 from planar_arm_interfaces.srv import MoveToTarget
 
 # The provided kinematics library — do not modify it.
@@ -91,17 +93,26 @@ class ControllerNode(Node):
         self._t_start = 0.0        # node-clock time the trajectory started [s]
         self._q_cmd = q_init.copy()
         self._qd_cmd = np.zeros_like(q_init)
+        ee = self.arm.end_effector(q_init)
+        self._goal_xy = (float(ee[0]), float(ee[1]))
+        self._projected = False
+        self._last_message = "Ready."
 
         # ---------------- ROS interfaces ----------------
         self._control_group = MutuallyExclusiveCallbackGroup()
         self._service_group = MutuallyExclusiveCallbackGroup()
 
         self.joint_pub = self.create_publisher(JointState, "joint_states", 10)
+        self.status_pub = self.create_publisher(
+            ControllerStatus, "controller_status", 10)
         self.move_srv = self.create_service(
             MoveToTarget, "move_to_target", self._on_move_to_target,
             callback_group=self._service_group)
         self.timer = self.create_timer(
             1.0 / rate, self._on_control_tick, callback_group=self._control_group)
+        # Low-rate status for GUIs/sequencers (multi-rate timers, same group).
+        self.status_timer = self.create_timer(
+            0.1, self._on_status_tick, callback_group=self._control_group)
 
         self.get_logger().info(
             f"controller_node ready: backend={self.backend.name}, "
@@ -150,6 +161,22 @@ class ControllerNode(Node):
         msg.effort = effort.tolist()
         self.joint_pub.publish(msg)
 
+    def _on_status_tick(self):
+        now = self.get_clock().now()
+        t = now.nanoseconds * 1e-9
+        msg = ControllerStatus()
+        msg.header.stamp = now.to_msg()
+        msg.control_mode = "position"
+        with self._lock:
+            moving = self._traj is not None
+            msg.state = "MOVING" if moving else "IDLE"
+            msg.progress = (min(1.0, (t - self._t_start) / self._traj.duration)
+                            if moving else 1.0)
+            msg.goal_x, msg.goal_y = self._goal_xy
+            msg.projected = self._projected
+            msg.message = self._last_message
+        self.status_pub.publish(msg)
+
     # ------------------------------------------------------------------
     # Service: move to a Cartesian target
     # ------------------------------------------------------------------
@@ -164,10 +191,13 @@ class ControllerNode(Node):
         result = self.planner.plan(q0, qd0, (request.x, request.y),
                                    duration=request.duration)
 
-        if result.success:
-            with self._lock:
+        with self._lock:
+            self._last_message = result.message
+            if result.success:
                 self._traj = result.trajectory
                 self._t_start = t_snap
+                self._goal_xy = result.goal_xy
+                self._projected = result.projected
 
         response.success = result.success
         response.projected = result.projected
@@ -177,10 +207,14 @@ class ControllerNode(Node):
         response.duration = float(result.duration)
         response.message = result.message
 
-        log = self.get_logger().info if result.success else self.get_logger().warn
-        log(f"move_to_target({request.x:.3f}, {request.y:.3f}) -> "
-            f"{'OK' if result.success else 'REJECTED'}: {result.message}"
-            + (f" [{result.duration:.2f}s]" if result.success else ""))
+        # Note: rclpy forbids changing severity at the same call site, so the
+        # two log levels need separate calls.
+        prefix = f"move_to_target({request.x:.3f}, {request.y:.3f}) -> "
+        if result.success:
+            self.get_logger().info(
+                f"{prefix}OK: {result.message} [{result.duration:.2f}s]")
+        else:
+            self.get_logger().warn(f"{prefix}REJECTED: {result.message}")
         return response
 
     def destroy_node(self):
