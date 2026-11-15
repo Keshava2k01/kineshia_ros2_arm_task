@@ -16,3 +16,5 @@ float64 goal_y
 float64[] joint_goal    # goal joint angles [rad]
 float64 duration        # planned trajectory duration [s]
 string message          # human-readable explanation (shown in the GUI)
+uint32 command_id       # id of the accepted command (0 if rejected); matches
+                        # ControllerStatus.command_id while/after it executes

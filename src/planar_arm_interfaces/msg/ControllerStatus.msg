@@ -8,3 +8,4 @@ float64 goal_y
 bool projected          # last goal was projected onto the workspace boundary
 float64 progress        # 0..1 along the active trajectory (1 when idle)
 string message          # last planner message
+uint32 command_id       # id of the active (or last completed) command

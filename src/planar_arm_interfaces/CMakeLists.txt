@@ -8,6 +8,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ControllerStatus.msg"
   "srv/MoveToTarget.srv"
+  "action/PickPlace.action"
   DEPENDENCIES std_msgs
 )
 

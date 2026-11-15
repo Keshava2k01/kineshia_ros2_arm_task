@@ -1,0 +1,20 @@
+# Pick an object at (pick_x, pick_y) and place it at (place_x, place_y).
+# Both points must be inside the workspace and above the ground; unlike a plain
+# move, they are NOT projected (grasping at a projected point grasps nothing).
+
+float64 pick_x
+float64 pick_y
+float64 place_x
+float64 place_y
+---
+bool success
+string message
+float64 elapsed          # total time [s]
+bool holding_object      # gripper state at the end (true if cancelled mid-carry)
+---
+string phase             # APPROACH_PICK, DESCEND_PICK, GRIP, LIFT, APPROACH_PLACE,
+                         # DESCEND_PLACE, RELEASE, RETREAT
+uint8 step               # 1-based index of the current step
+uint8 total_steps
+bool holding_object
+string message
