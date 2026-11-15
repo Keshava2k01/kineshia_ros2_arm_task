@@ -143,6 +143,30 @@ class MotionPlanner:
         return PlanResult(False, "No collision-free path to the goal "
                           "(the arm would pass below the ground).", q_goal=q_goal)
 
+    def plan_stop(self, q_now, qd_now):
+        """
+        Smoothly decelerate from (q_now, qd_now) to rest.
+
+        A quintic from velocity v to rest over T covers ~v*T/2, so we aim
+        there and let _segment stretch T if the accel limit needs it. If the
+        stopping path would violate limits/ground we hold position instead
+        (a velocity step, but never an unsafe pose).
+        """
+        q_now = np.asarray(q_now, dtype=float)
+        qd_now = np.zeros_like(q_now) if qd_now is None else np.asarray(qd_now, float)
+        speed = float(np.max(np.abs(qd_now)))
+        if speed < 1e-6:
+            hold = QuinticTrajectory(q_now, q_now, max(self.t_min / 2, 1e-3))
+            return PlanResult(True, "Already at rest.", q_goal=q_now, trajectory=hold)
+        T = max(self.t_min / 2, 1.5 * speed / self.a_max)
+        q_stop = q_now + qd_now * T / 2
+        traj = self._segment(q_now, qd_now, q_stop, T, [])
+        if self.pose_valid(q_stop) and self.trajectory_valid(traj):
+            return PlanResult(True, "Stopping.", q_goal=q_stop, trajectory=traj)
+        hold = QuinticTrajectory(q_now, q_now, max(self.t_min / 2, 1e-3))
+        return PlanResult(True, "Stopping (hold: decel path not safe).",
+                          q_goal=q_now, trajectory=hold)
+
     def _segment(self, q0, qd0, q1, duration, warnings):
         """
         Build one quintic segment within the velocity/acceleration limits.

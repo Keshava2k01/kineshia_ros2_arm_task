@@ -73,6 +73,27 @@ def test_short_requested_duration_is_stretched(planner):
     assert "exceeds joint limits" in res.message
 
 
+def test_stop_mid_motion_is_smooth_and_safe(planner):
+    move = planner.plan(READY, None, (4.0, 2.0))
+    q_mid, qd_mid, _ = move.trajectory.sample(move.trajectory.duration / 2)
+    assert np.max(np.abs(qd_mid)) > 0.1
+    stop = planner.plan_stop(q_mid, qd_mid)
+    assert stop.success
+    q0, qd0, _ = stop.trajectory.sample(0.0)
+    np.testing.assert_allclose(q0, q_mid)
+    np.testing.assert_allclose(qd0, qd_mid)
+    np.testing.assert_allclose(stop.trajectory.sample(stop.duration)[1], 0.0, atol=1e-9)
+    _, _, _, qdd = stop.trajectory.sample_many(400)
+    assert np.max(np.abs(qdd)) <= planner.a_max * 1.02
+    _assert_path_safe(planner, stop.trajectory)
+
+
+def test_stop_at_rest_holds(planner):
+    stop = planner.plan_stop(READY, np.zeros(3))
+    assert stop.success
+    np.testing.assert_allclose(stop.trajectory.end, READY)
+
+
 def test_ground_violating_direct_path_uses_ready_pose(planner):
     """Random valid pose pairs whose straight joint path dips below y = 0."""
     rng = np.random.default_rng(0)

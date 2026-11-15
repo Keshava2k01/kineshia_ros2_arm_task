@@ -6,6 +6,7 @@ Interfaces
     Publishes  /joint_states    sensor_msgs/JointState   at publish_rate_hz
     Publishes  /controller_status planar_arm_interfaces/msg/ControllerStatus @ 10 Hz
     Service    /move_to_target  planar_arm_interfaces/srv/MoveToTarget
+    Service    /stop            std_srvs/Trigger  (smooth deceleration to rest)
 
 Parameters
     publish_rate_hz          control/publish loop rate            [Hz]   50.0
@@ -36,9 +37,11 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.clock import Clock, ClockType
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 
 from planar_arm_interfaces.msg import ControllerStatus
 from planar_arm_interfaces.srv import MoveToTarget
@@ -87,6 +90,15 @@ class ControllerNode(Node):
 
         self.backend = make_backend(self._param("backend"), q_init)
 
+        # Trajectory timing runs on a STEADY clock: if the wall clock is
+        # stepped (NTP, WSL resync after a pause) a ROS-time trajectory would
+        # jump along its path. Message stamps stay on ROS time. Under
+        # use_sim_time (e.g. Gazebo) we must follow the simulation clock.
+        if self.get_parameter("use_sim_time").value:
+            self._timing_clock = self.get_clock()
+        else:
+            self._timing_clock = Clock(clock_type=ClockType.STEADY_TIME)
+
         # ---------------- shared state (guarded by _lock) ----------------
         self._lock = threading.Lock()
         self._traj = None          # active Trajectory or None when holding
@@ -97,6 +109,10 @@ class ControllerNode(Node):
         self._goal_xy = (float(ee[0]), float(ee[1]))
         self._projected = False
         self._last_message = "Ready."
+        # Incremented for every accepted command (move or stop). Clients wait
+        # for status.command_id == their id && IDLE, which avoids mistaking a
+        # stale IDLE (published just before their command) for completion.
+        self._command_id = 0
 
         # ---------------- ROS interfaces ----------------
         self._control_group = MutuallyExclusiveCallbackGroup()
@@ -108,6 +124,12 @@ class ControllerNode(Node):
         self.move_srv = self.create_service(
             MoveToTarget, "move_to_target", self._on_move_to_target,
             callback_group=self._service_group)
+        self.stop_srv = self.create_service(
+            Trigger, "stop", self._on_stop, callback_group=self._service_group)
+        # The timers stay on the node clock: measured on Humble, a timer on
+        # the STEADY clock fired ~1.4 ms late every period (46.6 Hz instead
+        # of 50), while the ROS-time timer holds 50.0 Hz. Only trajectory
+        # sampling needs to be immune to clock steps.
         self.timer = self.create_timer(
             1.0 / rate, self._on_control_tick, callback_group=self._control_group)
         # Low-rate status for GUIs/sequencers (multi-rate timers, same group).
@@ -123,7 +145,8 @@ class ControllerNode(Node):
         return self.get_parameter(name).value
 
     def _now(self):
-        return self.get_clock().now().nanoseconds * 1e-9
+        """Trajectory time [s] (steady clock unless use_sim_time)."""
+        return self._timing_clock.now().nanoseconds * 1e-9
 
     def _desired_state(self, t):
         """Commanded (q, qd) at time t. Caller must hold _lock."""
@@ -136,8 +159,8 @@ class ControllerNode(Node):
     # Control loop (fixed rate)
     # ------------------------------------------------------------------
     def _on_control_tick(self):
-        now = self.get_clock().now()
-        t = now.nanoseconds * 1e-9
+        now = self.get_clock().now()        # for the message stamp
+        t = self._now()                     # for trajectory sampling
         with self._lock:
             q, qd = self._desired_state(t)
             if self._traj is not None and t - self._t_start >= self._traj.duration:
@@ -163,7 +186,7 @@ class ControllerNode(Node):
 
     def _on_status_tick(self):
         now = self.get_clock().now()
-        t = now.nanoseconds * 1e-9
+        t = self._now()
         msg = ControllerStatus()
         msg.header.stamp = now.to_msg()
         msg.control_mode = "position"
@@ -175,6 +198,7 @@ class ControllerNode(Node):
             msg.goal_x, msg.goal_y = self._goal_xy
             msg.projected = self._projected
             msg.message = self._last_message
+            msg.command_id = self._command_id
         self.status_pub.publish(msg)
 
     # ------------------------------------------------------------------
@@ -194,6 +218,8 @@ class ControllerNode(Node):
         with self._lock:
             self._last_message = result.message
             if result.success:
+                self._command_id += 1
+                response.command_id = self._command_id
                 self._traj = result.trajectory
                 self._t_start = t_snap
                 self._goal_xy = result.goal_xy
@@ -215,6 +241,27 @@ class ControllerNode(Node):
                 f"{prefix}OK: {result.message} [{result.duration:.2f}s]")
         else:
             self.get_logger().warn(f"{prefix}REJECTED: {result.message}")
+        return response
+
+    # ------------------------------------------------------------------
+    # Service: smooth stop (used by cancel)
+    # ------------------------------------------------------------------
+    def _on_stop(self, request, response):
+        with self._lock:
+            t_snap = self._now()
+            q0, qd0 = self._desired_state(t_snap)
+        result = self.planner.plan_stop(q0, qd0)
+        with self._lock:
+            self._command_id += 1
+            self._traj = result.trajectory
+            self._t_start = t_snap
+            ee = self.arm.end_effector(result.q_goal)
+            self._goal_xy = (float(ee[0]), float(ee[1]))
+            self._projected = False
+            self._last_message = result.message
+        response.success = True
+        response.message = result.message
+        self.get_logger().info(f"stop -> {result.message} [{result.duration:.2f}s]")
         return response
 
     def destroy_node(self):
