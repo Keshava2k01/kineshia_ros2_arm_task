@@ -19,6 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument("max_joint_acceleration", default_value="2.0"),
         DeclareLaunchArgument("min_duration", default_value="0.5"),
         DeclareLaunchArgument("backend", default_value="sim"),
+        DeclareLaunchArgument("approach_offset", default_value="0.5"),
     ]
 
     def p(name, type_):
@@ -38,6 +39,14 @@ def generate_launch_description():
         }],
     )
 
+    pick_place = Node(
+        package="planar_arm_control",
+        executable="pick_place_node",
+        name="pick_place_node",
+        output="screen",
+        parameters=[{"approach_offset": p("approach_offset", float)}],
+    )
+
     gui = Node(
         package="planar_arm_control",
         executable="gui_node",
@@ -45,4 +54,4 @@ def generate_launch_description():
         output="screen",
     )
 
-    return LaunchDescription(args + [controller, gui])
+    return LaunchDescription(args + [controller, pick_place, gui])
