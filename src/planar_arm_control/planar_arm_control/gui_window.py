@@ -2,11 +2,15 @@
 gui_window.py  —  the operator window (Qt only; no rclpy in this file).
 
 The window never touches ROS directly. It is given:
-    buffer       TelemetryBuffer filled by the ROS thread (pulled at 30 Hz)
-    signals      QObject with move_result(dict) / status(dict) / error(str)
-                 signals, emitted from the ROS thread and delivered here as
-                 queued (thread-safe) Qt connections
-    send_target  callable(x, y) -> bool, non-blocking (call_async under the hood)
+    buffer     TelemetryBuffer filled by the ROS thread (pulled at 30 Hz)
+    signals    QObject whose signals (move_result, status, error, pp_state,
+               pp_feedback, pp_result, gripper) are emitted from the ROS
+               thread and delivered here as queued (thread-safe) connections
+    commands   object with non-blocking methods
+                   send_target(x, y) -> bool
+                   send_pick_place((x, y), (x, y)) -> bool
+                   cancel_pick_place()
+                   pick_place_available() -> bool
 
 Keeping ROS out of this file means the threading boundary is explicit and the
 window could be driven by a different transport (or a test) unchanged.
@@ -30,7 +34,9 @@ BANNER_STYLES = {
     "info": "background:#1b3a4b; color:#e0f7fa;",
     "warn": "background:#5d4037; color:#ffe0b2; font-weight:bold;",
     "error": "background:#5c1a1a; color:#ffcdd2; font-weight:bold;",
+    "ok": "background:#1b5e20; color:#c8e6c9; font-weight:bold;",
 }
+OBJECT_COLOR = "#ff9800"
 
 
 def _fmt(value, decimals):
@@ -40,13 +46,19 @@ def _fmt(value, decimals):
 
 class ArmWindow(QtWidgets.QMainWindow):
 
-    def __init__(self, arm, buffer, signals, send_target):
+    def __init__(self, arm, buffer, signals, commands):
         super().__init__()
         self.arm = arm
         self.buffer = buffer
-        self.send_target = send_target
+        self.commands = commands
         self.reach = float(sum(arm.link_lengths))
         self.status = {}
+        self.move_buttons = []
+        self.pp_running = False
+        self.obj_xy = None          # object position when not held
+        self.holding = False        # simulated gripper closed
+        self._pending_pick = None
+        self._last_ee = None
         self._frames = 0
         self._fps = 0.0
         self._fps_t0 = time.monotonic()
@@ -70,11 +82,20 @@ class ArmWindow(QtWidgets.QMainWindow):
         signals.move_result.connect(self._on_move_result)
         signals.status.connect(self._on_status)
         signals.error.connect(lambda text: self._banner(text, "error"))
+        signals.pp_state.connect(self._on_pp_state)
+        signals.pp_feedback.connect(self._on_pp_feedback)
+        signals.pp_result.connect(self._on_pp_result)
+        signals.gripper.connect(self._on_gripper)
 
         self._update_pick_place_markers()
         self.render_timer = QtCore.QTimer(self)
         self.render_timer.timeout.connect(self._render)
         self.render_timer.start(int(1000 / RENDER_HZ))
+        # Low-rate check whether the pick-and-place action server is up.
+        self.avail_timer = QtCore.QTimer(self)
+        self.avail_timer.timeout.connect(self._update_pp_availability)
+        self.avail_timer.start(1000)
+        self._update_pp_availability()
 
     # ==================================================================
     # Layout
@@ -134,6 +155,11 @@ class ArmWindow(QtWidgets.QMainWindow):
                                                 style=QtCore.Qt.DashLine))
         view.addItem(self.req_marker)
         view.addItem(self.goal_marker)
+
+        # The object being picked (appears when a pick-and-place starts).
+        self.obj_marker = pg.ScatterPlotItem(symbol="s", size=18,
+                                             brush=OBJECT_COLOR, pen=pg.mkPen("k"))
+        view.addItem(self.obj_marker)
 
         view.scene().sigMouseClicked.connect(self._on_view_clicked)
         self.arm_view = view
@@ -231,23 +257,32 @@ class ArmWindow(QtWidgets.QMainWindow):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(slot)
             btn_grid.addWidget(b, i // 2, i % 2)
+            self.move_buttons.append(b)
         form.addLayout(btn_grid, 3, 0, 1, 3)
         lay.addWidget(tgt)
 
-        # ---- pick & place sequence (ROS 2 action) ----
-        # TODO(step 3): wire to the PickPlace action client (goal/feedback/cancel).
-        self.pp_group = QtWidgets.QGroupBox("Pick && place sequence")
+        # ---- pick & place sequence (ROS 2 action /pick_place) ----
+        self.pp_group = QtWidgets.QGroupBox("Pick && place sequence (action)")
         pp = QtWidgets.QVBoxLayout(self.pp_group)
         row = QtWidgets.QHBoxLayout()
         self.pp_run = QtWidgets.QPushButton("Run pick && place")
         self.pp_cancel = QtWidgets.QPushButton("Cancel")
+        self.pp_run.clicked.connect(self._run_pick_place)
+        self.pp_cancel.clicked.connect(self.commands.cancel_pick_place)
         row.addWidget(self.pp_run)
         row.addWidget(self.pp_cancel)
         pp.addLayout(row)
-        self.pp_label = QtWidgets.QLabel("Sequencer not available yet.")
+        self.pp_progress = QtWidgets.QProgressBar()
+        self.pp_progress.setFormat("%v / %m")
+        self.pp_progress.setRange(0, 1)
+        self.pp_progress.setValue(0)
+        pp.addWidget(self.pp_progress)
+        self.pp_label = QtWidgets.QLabel("Waiting for /pick_place action server…")
+        self.pp_label.setWordWrap(True)
         self.pp_label.setStyleSheet("color:#90a4ae;")
         pp.addWidget(self.pp_label)
-        self.pp_group.setEnabled(False)
+        self.pp_cancel.setEnabled(False)
+        self.pp_run.setEnabled(False)
         lay.addWidget(self.pp_group)
 
         lay.addStretch(1)
@@ -269,8 +304,36 @@ class ArmWindow(QtWidgets.QMainWindow):
         self.req_marker.setData([x], [y])
         self.goal_marker.setData([], [])
         self.proj_line.setData([], [])
-        if self.send_target(x, y):
+        if self.commands.send_target(x, y):
             self._banner(f"Sent target ({x:.2f}, {y:.2f})…", "info")
+
+    def _run_pick_place(self):
+        pick = (self.pick_x.value(), self.pick_y.value())
+        place = (self.place_x.value(), self.place_y.value())
+        self.req_marker.setData([], [])
+        self.goal_marker.setData([], [])
+        self.proj_line.setData([], [])
+        if self.commands.send_pick_place(pick, place):
+            self._pending_pick = pick
+            self.pp_run.setEnabled(False)
+            self.pp_label.setText("Sending goal…")
+
+    def _set_pp_running(self, running):
+        self.pp_running = running
+        self.pp_run.setEnabled(not running and self.commands.pick_place_available())
+        self.pp_cancel.setEnabled(running)
+        for b in self.move_buttons:
+            b.setEnabled(not running)
+
+    def _update_pp_availability(self):
+        if self.pp_running:
+            return
+        available = self.commands.pick_place_available()
+        self.pp_run.setEnabled(available)
+        if not available:
+            self.pp_label.setText("Waiting for /pick_place action server…")
+        elif self.pp_label.text().startswith("Waiting"):
+            self.pp_label.setText("Ready.")
 
     def _on_view_clicked(self, ev):
         if ev.button() != QtCore.Qt.LeftButton:
@@ -321,6 +384,43 @@ class ArmWindow(QtWidgets.QMainWindow):
     def _on_status(self, s):
         self.status = s
 
+    def _on_pp_state(self, state):
+        if state == "accepted":
+            self._set_pp_running(True)
+            if not self.holding and self._pending_pick is not None:
+                self.obj_xy = self._pending_pick   # object appears at pick
+            self.pp_label.setText("Goal accepted.")
+            self._banner("Pick-and-place started.", "info")
+        elif state == "rejected":
+            self._set_pp_running(False)
+            self._banner("Pick-and-place goal rejected (sequencer busy?).", "error")
+
+    def _on_pp_feedback(self, fb):
+        self.pp_progress.setRange(0, max(1, fb["total_steps"]))
+        self.pp_progress.setValue(fb["step"])
+        self.pp_label.setText(f"{fb['phase']}: {fb['message']}")
+
+    def _on_pp_result(self, r):
+        self._set_pp_running(False)
+        status = r["status"]
+        if status == "SUCCEEDED":
+            self.pp_progress.setValue(self.pp_progress.maximum())
+            self._banner(f"✔ Pick-and-place done in {r['elapsed']:.1f} s. "
+                         f"{r['message']}", "ok")
+        elif status == "CANCELED":
+            self._banner(f"Pick-and-place cancelled: {r['message']}"
+                         + (" Object still held." if r["holding_object"] else ""), "warn")
+        else:
+            self._banner(f"Pick-and-place {status.lower()}: {r['message']}", "error")
+        self.pp_label.setText(f"{status}: {r['message']}")
+
+    def _on_gripper(self, closed):
+        if closed and not self.holding:
+            self.holding = True
+        elif not closed and self.holding:
+            self.holding = False
+            self.obj_xy = self._last_ee          # dropped where the tool is
+
     def _banner(self, text, level):
         self.banner.setText(text)
         self.banner.setStyleSheet(BANNER_STYLES[level] + "border-radius:4px;")
@@ -353,7 +453,12 @@ class ArmWindow(QtWidgets.QMainWindow):
         pts = np.array(self.arm.forward_kinematics(q[-1]))
         self.links.setData(pts[:, 0], pts[:, 1])
         ee = pts[-1]
+        self._last_ee = (float(ee[0]), float(ee[1]))
         self.ee_marker.setData([ee[0]], [ee[1]])
+        if self.holding:
+            self.obj_marker.setData([ee[0]], [ee[1]])
+        elif self.obj_xy is not None:
+            self.obj_marker.setData([self.obj_xy[0]], [self.obj_xy[1]])
 
         # End-effector trail (last TRAIL_S seconds, subsampled)
         sel = q[t >= t[-1] - TRAIL_S][::2]
