@@ -12,6 +12,9 @@ A small but complete ROS 2 (Humble) system for a simulated 3-DoF planar arm:
   plots, end-effector telemetry and pick/place controls. The Qt event loop and the
   ROS 2 executor run side by side without blocking each other.
 
+**Demo video:** [watch on Google Drive](https://drive.google.com/file/d/1nSMy3dZHzbfrHhmIwJg9qR3Zk1jBBdgy/view?usp=sharing).
+It shows the fixed test scenario: pick (4, 2) → place (−3, 3), and the unreachable (7, 3) target.
+
 | Brief item | Status |
 |---|---|
 | Controller node (IK, smooth trajectory, fixed-rate JointState, limits + ground, swappable backend) | ✅ |
