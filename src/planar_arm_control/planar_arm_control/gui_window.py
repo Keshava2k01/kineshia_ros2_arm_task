@@ -46,10 +46,12 @@ def _fmt(value, decimals):
 
 class ArmWindow(QtWidgets.QMainWindow):
 
-    def __init__(self, arm, buffer, signals, commands):
+    def __init__(self, arm, buffer, signals, commands, err_buffer=None, ref_buffer=None):
         super().__init__()
         self.arm = arm
         self.buffer = buffer
+        self.err_buffer = err_buffer    # (tracking error, effort) from /tracking_error
+        self.ref_buffer = ref_buffer    # reference q, drawn as a ghost arm
         self.commands = commands
         self.reach = float(sum(arm.link_lengths))
         self.status = {}
@@ -70,8 +72,8 @@ class ArmWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         root = QtWidgets.QHBoxLayout(central)
         left = QtWidgets.QVBoxLayout()
-        left.addWidget(self._build_arm_view(), stretch=3)
-        left.addWidget(self._build_joint_plots(), stretch=2)
+        left.addWidget(self._build_arm_view(), stretch=5)
+        left.addWidget(self._build_joint_plots(), stretch=4)
         root.addLayout(left, stretch=1)
         root.addWidget(self._build_side_panel())
         self.setCentralWidget(central)
@@ -123,6 +125,10 @@ class ArmWindow(QtWidgets.QMainWindow):
                   pen=pg.mkPen("#78909c", width=1, style=QtCore.Qt.DashLine))
 
         self.trail = view.plot(pen=pg.mkPen(255, 255, 255, 70, width=1.5))
+        # Reference ("ghost") arm: where the trajectory wants the arm to be.
+        # Only visible when it differs from the measured pose (pid mode).
+        self.ghost = view.plot(pen=pg.mkPen(129, 212, 250, 150, width=3,
+                                            style=QtCore.Qt.DashLine))
         self.links = view.plot(
             pen=pg.mkPen("#eceff1", width=7), symbol="o", symbolSize=13,
             symbolBrush="#263238", symbolPen=pg.mkPen("#eceff1", width=2))
@@ -172,7 +178,7 @@ class ArmWindow(QtWidgets.QMainWindow):
         for i in range(self.arm.n_joints):
             p = glw.addPlot(row=i, col=0)
             p.showGrid(x=True, y=True, alpha=0.2)
-            p.setLabel("left", f"q{i + 1} [deg]")
+            p.setLabel("left", f"q{i + 1}°")
             p.setXRange(-PLOT_WINDOW_S, 0)
             lo, hi = np.degrees(self.arm.joint_limits[i])
             for lim in (lo, hi):
@@ -183,11 +189,19 @@ class ArmWindow(QtWidgets.QMainWindow):
                 first = p
             else:
                 p.setXLink(first)
-            if i < self.arm.n_joints - 1:
-                p.getAxis("bottom").setStyle(showValues=False)
-            else:
-                p.setLabel("bottom", "time [s]")
+            p.getAxis("bottom").setStyle(showValues=False)
             self.joint_curves.append(p.plot(pen=pg.mkPen(JOINT_COLORS[i], width=2)))
+
+        # Tracking error (reference - measured): zero in position mode.
+        ep = glw.addPlot(row=self.arm.n_joints, col=0)
+        ep.showGrid(x=True, y=True, alpha=0.2)
+        ep.setLabel("left", "err°")
+        ep.setLabel("bottom", "time [s]")
+        ep.setXLink(first)
+        ep.addLegend(offset=(5, 5))
+        ep.enableAutoRange(axis="y")
+        self.err_curves = [ep.plot(pen=pg.mkPen(JOINT_COLORS[i], width=2), name=f"e{i + 1}")
+                           for i in range(self.arm.n_joints)]
         return glw
 
     def _build_side_panel(self):
@@ -206,8 +220,9 @@ class ArmWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout(tele)
         self.lbl = {}
         rows = [("ee", "EE (x, y)"), ("q", "q [deg]"),
-                ("qd", "vel [deg/s]"), ("state", "Controller"),
-                ("goal", "Goal (x, y)")]
+                ("qd", "vel [deg/s]"), ("err", "error [deg]"),
+                ("peak", "peak |e| 10s"), ("tau", "torque [N·m]"),
+                ("state", "Controller"), ("goal", "Goal (x, y)")]
         for r, (key, name) in enumerate(rows):
             grid.addWidget(QtWidgets.QLabel(name), r, 0)
             value = QtWidgets.QLabel("—")
@@ -221,7 +236,7 @@ class ArmWindow(QtWidgets.QMainWindow):
         grid.setColumnStretch(1, 1)
         self.msg_label = QtWidgets.QLabel("")
         self.msg_label.setWordWrap(True)
-        self.msg_label.setMinimumHeight(95)
+        self.msg_label.setMinimumHeight(60)
         self.msg_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
         self.msg_label.setStyleSheet("color:#90a4ae;")
         grid.addWidget(self.msg_label, len(rows) + 1, 0, 1, 2)
@@ -381,6 +396,27 @@ class ArmWindow(QtWidgets.QMainWindow):
             self._banner(f"Moving to ({gx:.2f}, {gy:.2f}) — "
                          f"{r['duration']:.2f} s. {r['message']}", "info")
 
+    def _render_tracking(self, t_now, q_meas):
+        """Error plot, error/torque readouts and the ghost reference arm."""
+        if self.err_buffer is None:
+            return
+        te, e, tau = self.err_buffer.snapshot()
+        if te.size:
+            sel = te >= t_now - PLOT_WINDOW_S
+            e_deg = np.degrees(e[sel])
+            for i, curve in enumerate(self.err_curves):
+                curve.setData(te[sel] - t_now, e_deg[:, i])
+            self.lbl["err"].setText(", ".join(_fmt(v, 2) for v in e_deg[-1]))
+            self.lbl["peak"].setText(f"{_fmt(np.max(np.abs(e_deg)), 2)} deg")
+            self.lbl["tau"].setText(", ".join(_fmt(v, 1) for v in tau[-1])
+                                    if np.any(tau[-1]) else "— (ideal servo)")
+        latest = self.ref_buffer.latest() if self.ref_buffer is not None else None
+        if latest is not None and np.max(np.abs(latest[1] - q_meas)) > 1e-4:
+            pts = np.array(self.arm.forward_kinematics(latest[1]))
+            self.ghost.setData(pts[:, 0], pts[:, 1])
+        else:
+            self.ghost.setData([], [])
+
     def _on_status(self, s):
         self.status = s
 
@@ -476,6 +512,7 @@ class ArmWindow(QtWidgets.QMainWindow):
         self.lbl["ee"].setText(f"({_fmt(ee[0], 3)}, {_fmt(ee[1], 3)})")
         self.lbl["q"].setText(", ".join(_fmt(v, 1) for v in np.degrees(q[-1])))
         self.lbl["qd"].setText(", ".join(_fmt(v, 1) for v in np.degrees(qd[-1])))
+        self._render_tracking(t[-1], q[-1])
         s = self.status
         if s:
             self.lbl["state"].setText(f"{s['state']} ({s['control_mode']})")

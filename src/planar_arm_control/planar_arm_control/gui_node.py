@@ -43,7 +43,7 @@ from std_msgs.msg import Bool
 from PyQt5 import QtCore, QtWidgets
 
 from planar_arm_interfaces.action import PickPlace
-from planar_arm_interfaces.msg import ControllerStatus
+from planar_arm_interfaces.msg import ControllerStatus, TrackingError
 from planar_arm_interfaces.srv import MoveToTarget
 
 from planar_arm_control.gui_window import ArmWindow
@@ -73,14 +73,17 @@ class QtBridge(QtCore.QObject):
 
 class GuiNode(Node):
 
-    def __init__(self, bridge, buffer):
+    def __init__(self, bridge, buffer, err_buffer, ref_buffer):
         super().__init__("gui_node")
         self.arm = PlanarArm(LINK_LENGTHS)
         self.bridge = bridge
-        self.buffer = buffer
+        self.buffer = buffer            # measured q, qd
+        self.err_buffer = err_buffer    # tracking error, effort
+        self.ref_buffer = ref_buffer    # reference q (ghost arm)
         self._pp_goal = None        # active ClientGoalHandle (ROS thread only)
 
         self.create_subscription(JointState, "joint_states", self._on_joint_state, 10)
+        self.create_subscription(TrackingError, "tracking_error", self._on_tracking, 10)
         self.create_subscription(ControllerStatus, "controller_status",
                                  self._on_status, 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -125,6 +128,12 @@ class GuiNode(Node):
         if len(msg.position) != self.arm.n_joints:
             return
         self.buffer.append(msg.position, msg.velocity)
+
+    def _on_tracking(self, msg):
+        if len(msg.error) != self.arm.n_joints:
+            return
+        self.err_buffer.append(msg.error, msg.effort)
+        self.ref_buffer.append(msg.reference)
 
     def _on_status(self, msg):
         self.bridge.status.emit({
@@ -232,7 +241,9 @@ def main(args=None):
 
     bridge = QtBridge()
     buffer = TelemetryBuffer(window_s=20.0)
-    node = GuiNode(bridge, buffer)
+    err_buffer = TelemetryBuffer(window_s=20.0)
+    ref_buffer = TelemetryBuffer(window_s=1.0)
+    node = GuiNode(bridge, buffer, err_buffer, ref_buffer)
 
     executor = SingleThreadedExecutor()
     executor.add_node(node)
@@ -240,7 +251,8 @@ def main(args=None):
                                   name="ros_executor", daemon=True)
     ros_thread.start()
 
-    window = ArmWindow(node.arm, buffer, bridge, node)
+    window = ArmWindow(node.arm, buffer, bridge, node,
+                       err_buffer=err_buffer, ref_buffer=ref_buffer)
     window.show()
 
     # Ctrl+C / launch shutdown: Qt's C++ loop does not run Python signal
