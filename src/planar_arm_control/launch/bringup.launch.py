@@ -19,6 +19,9 @@ def generate_launch_description():
         DeclareLaunchArgument("max_joint_acceleration", default_value="2.0"),
         DeclareLaunchArgument("min_duration", default_value="0.5"),
         DeclareLaunchArgument("backend", default_value="sim"),
+        DeclareLaunchArgument("control_mode", default_value="position",
+                              description="position | pid"),
+        DeclareLaunchArgument("pid_bandwidth", default_value="10.0"),
         DeclareLaunchArgument("approach_offset", default_value="0.5"),
     ]
 
@@ -36,6 +39,8 @@ def generate_launch_description():
             "max_joint_acceleration": p("max_joint_acceleration", float),
             "min_duration": p("min_duration", float),
             "backend": p("backend", str),
+            "control_mode": p("control_mode", str),
+            "pid_bandwidth": p("pid_bandwidth", float),
         }],
     )
 

@@ -5,6 +5,7 @@ controller_node.py  —  owns the arm state, plans and executes trajectories.
 Interfaces
     Publishes  /joint_states    sensor_msgs/JointState   at publish_rate_hz
     Publishes  /controller_status planar_arm_interfaces/msg/ControllerStatus @ 10 Hz
+    Publishes  /tracking_error  planar_arm_interfaces/msg/TrackingError at publish_rate_hz
     Service    /move_to_target  planar_arm_interfaces/srv/MoveToTarget
     Service    /stop            std_srvs/Trigger  (smooth deceleration to rest)
 
@@ -16,11 +17,21 @@ Parameters
     initial_joint_positions  start pose                           [rad]  [pi/2, 0, 0]
     joint_names              names in JointState                  [joint1..3]
     backend                  hardware backend ("sim")
+    control_mode             "position" (ideal servo) | "pid" (torque PID on dynamics)
+    pid_bandwidth            PID closed-loop natural frequency    [rad/s] 10.0
+    pid_damping              PID damping ratio                            1.0
+    pid_integral_ratio       Ki = Kp * bandwidth * ratio                  0.3
+    settle_tolerance         max |error| to declare a move done   [rad]  0.001
+    settle_timeout           give up settling after               [s]    2.0
 
 Data flow
     service ──► MotionPlanner ──► active Trajectory
-    timer   ──► sample(t) ──► backend.write_command ──► backend.read_state
-                                                    ──► /joint_states
+    timer   ──► sample(t) ──► backend.write_command ──► backend.advance(dt)
+                          ──► backend.read_state ──► /joint_states, /tracking_error
+
+A move is complete when its trajectory has ended AND the measured joints are
+within settle_tolerance of the goal (immediately in position mode; after the
+PID settles in pid mode) — like a servo's "in-position" flag.
 
 Threading
     The timer and the service run in separate mutually-exclusive callback
@@ -43,7 +54,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 
-from planar_arm_interfaces.msg import ControllerStatus
+from planar_arm_interfaces.msg import ControllerStatus, TrackingError
 from planar_arm_interfaces.srv import MoveToTarget
 
 # The provided kinematics library — do not modify it.
@@ -68,6 +79,12 @@ class ControllerNode(Node):
         self.declare_parameter("initial_joint_positions", [np.pi / 2, 0.0, 0.0])
         self.declare_parameter("joint_names", ["joint1", "joint2", "joint3"])
         self.declare_parameter("backend", "sim")
+        self.declare_parameter("control_mode", "position")
+        self.declare_parameter("pid_bandwidth", 10.0)
+        self.declare_parameter("pid_damping", 1.0)
+        self.declare_parameter("pid_integral_ratio", 0.3)
+        self.declare_parameter("settle_tolerance", 0.001)
+        self.declare_parameter("settle_timeout", 2.0)
 
         rate = self._param("publish_rate_hz")
         if rate <= 0.0:
@@ -88,7 +105,16 @@ class ControllerNode(Node):
             raise ValueError(f"initial_joint_positions {q_init.tolist()} violate "
                              "joint limits or the ground constraint")
 
-        self.backend = make_backend(self._param("backend"), q_init)
+        self.control_mode = self._param("control_mode")
+        pid_kwargs = {}
+        if self.control_mode == "pid":
+            pid_kwargs = dict(bandwidth=self._param("pid_bandwidth"),
+                              damping=self._param("pid_damping"),
+                              integral_ratio=self._param("pid_integral_ratio"))
+        self.backend = make_backend(self._param("backend"), self.control_mode,
+                                    q_init, arm=self.arm, **pid_kwargs)
+        self.settle_tolerance = self._param("settle_tolerance")
+        self.settle_timeout = self._param("settle_timeout")
 
         # Trajectory timing runs on a STEADY clock: if the wall clock is
         # stepped (NTP, WSL resync after a pause) a ROS-time trajectory would
@@ -113,6 +139,8 @@ class ControllerNode(Node):
         # for status.command_id == their id && IDLE, which avoids mistaking a
         # stale IDLE (published just before their command) for completion.
         self._command_id = 0
+        self._settle_start = None   # time the active trajectory ended [s]
+        self._last_tick = None      # for the plant's dt (steady clock)
 
         # ---------------- ROS interfaces ----------------
         self._control_group = MutuallyExclusiveCallbackGroup()
@@ -121,6 +149,7 @@ class ControllerNode(Node):
         self.joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self.status_pub = self.create_publisher(
             ControllerStatus, "controller_status", 10)
+        self.tracking_pub = self.create_publisher(TrackingError, "tracking_error", 10)
         self.move_srv = self.create_service(
             MoveToTarget, "move_to_target", self._on_move_to_target,
             callback_group=self._service_group)
@@ -137,7 +166,8 @@ class ControllerNode(Node):
             0.1, self._on_status_tick, callback_group=self._control_group)
 
         self.get_logger().info(
-            f"controller_node ready: backend={self.backend.name}, "
+            f"controller_node ready: backend={self.backend.name} "
+            f"(control_mode={self.control_mode}), "
             f"rate={rate:.0f} Hz, q0={np.degrees(q_init).round(1).tolist()} deg")
 
     # ------------------------------------------------------------------
@@ -149,32 +179,33 @@ class ControllerNode(Node):
         return self._timing_clock.now().nanoseconds * 1e-9
 
     def _desired_state(self, t):
-        """Commanded (q, qd) at time t. Caller must hold _lock."""
+        """Reference (q, qd, qdd) at time t. Caller must hold _lock."""
         if self._traj is None:
-            return self._q_cmd.copy(), np.zeros_like(self._q_cmd)
-        q, qd, _ = self._traj.sample(t - self._t_start)
-        return q, qd
+            zero = np.zeros_like(self._q_cmd)
+            return self._q_cmd.copy(), zero, zero.copy()
+        return self._traj.sample(t - self._t_start)
 
     # ------------------------------------------------------------------
     # Control loop (fixed rate)
     # ------------------------------------------------------------------
     def _on_control_tick(self):
-        now = self.get_clock().now()        # for the message stamp
-        t = self._now()                     # for trajectory sampling
+        now = self.get_clock().now()        # for the message stamps
+        t = self._now()                     # for trajectory sampling / dt
         with self._lock:
-            q, qd = self._desired_state(t)
-            if self._traj is not None and t - self._t_start >= self._traj.duration:
-                self._traj = None
-                qd = np.zeros_like(q)
-                self.get_logger().info(
-                    "Goal reached: q = "
-                    f"{np.degrees(q).round(2).tolist()} deg, ee = "
-                    f"({self.arm.end_effector(q)[0]:.3f}, "
-                    f"{self.arm.end_effector(q)[1]:.3f})")
+            traj = self._traj
+            q, qd, qdd = self._desired_state(t)
+            ended = traj is not None and t - self._t_start >= traj.duration
             self._q_cmd, self._qd_cmd = q, qd
 
-        self.backend.write_command(q, qd)
+        dt = 0.0 if self._last_tick is None else min(max(t - self._last_tick, 0.0), 0.1)
+        self._last_tick = t
+        self.backend.write_command(q, qd, qdd)
+        self.backend.advance(dt)
         q_meas, qd_meas, effort = self.backend.read_state()
+        error = q - q_meas
+
+        if ended:
+            self._check_settled(traj, t, error, q_meas)
 
         msg = JointState()
         msg.header.stamp = now.to_msg()
@@ -184,15 +215,46 @@ class ControllerNode(Node):
         msg.effort = effort.tolist()
         self.joint_pub.publish(msg)
 
+        track = TrackingError()
+        track.header.stamp = msg.header.stamp
+        track.reference = q.tolist()
+        track.measured = q_meas.tolist()
+        track.error = error.tolist()
+        track.effort = effort.tolist()
+        self.tracking_pub.publish(track)
+
+    def _check_settled(self, traj, t, error, q_meas):
+        """Retire a finished trajectory once the joints are in position."""
+        with self._lock:
+            if self._traj is not traj:          # replaced meanwhile
+                return
+            if self._settle_start is None:
+                self._settle_start = t
+            err = float(np.max(np.abs(error)))
+            settled = err < self.settle_tolerance
+            timed_out = t - self._settle_start > self.settle_timeout
+            if not (settled or timed_out):
+                return
+            self._traj = None
+            self._settle_start = None
+        ee = self.arm.end_effector(q_meas)
+        text = (f"q = {np.degrees(q_meas).round(2).tolist()} deg, "
+                f"ee = ({ee[0]:.3f}, {ee[1]:.3f}), |e|max = {np.degrees(err):.4f} deg")
+        if settled:
+            self.get_logger().info(f"Goal reached: {text}")
+        else:
+            self.get_logger().warn(f"Settle timeout ({self.settle_timeout:.1f}s): {text}")
+
     def _on_status_tick(self):
         now = self.get_clock().now()
         t = self._now()
         msg = ControllerStatus()
         msg.header.stamp = now.to_msg()
-        msg.control_mode = "position"
+        msg.control_mode = self.control_mode
         with self._lock:
             moving = self._traj is not None
-            msg.state = "MOVING" if moving else "IDLE"
+            settling = moving and t - self._t_start >= self._traj.duration
+            msg.state = "SETTLING" if settling else ("MOVING" if moving else "IDLE")
             msg.progress = (min(1.0, (t - self._t_start) / self._traj.duration)
                             if moving else 1.0)
             msg.goal_x, msg.goal_y = self._goal_xy
@@ -210,7 +272,7 @@ class ControllerNode(Node):
         # old one a few ms later the hand-over is continuous to first order.
         with self._lock:
             t_snap = self._now()
-            q0, qd0 = self._desired_state(t_snap)
+            q0, qd0, _ = self._desired_state(t_snap)
 
         result = self.planner.plan(q0, qd0, (request.x, request.y),
                                    duration=request.duration)
@@ -222,6 +284,7 @@ class ControllerNode(Node):
                 response.command_id = self._command_id
                 self._traj = result.trajectory
                 self._t_start = t_snap
+                self._settle_start = None
                 self._goal_xy = result.goal_xy
                 self._projected = result.projected
 
@@ -249,12 +312,13 @@ class ControllerNode(Node):
     def _on_stop(self, request, response):
         with self._lock:
             t_snap = self._now()
-            q0, qd0 = self._desired_state(t_snap)
+            q0, qd0, _ = self._desired_state(t_snap)
         result = self.planner.plan_stop(q0, qd0)
         with self._lock:
             self._command_id += 1
             self._traj = result.trajectory
             self._t_start = t_snap
+            self._settle_start = None
             ee = self.arm.end_effector(result.q_goal)
             self._goal_xy = (float(ee[0]), float(ee[1]))
             self._projected = False
