@@ -18,8 +18,9 @@ A small but complete ROS 2 (Humble) system for a simulated 3-DoF planar arm:
 | Telemetry GUI node (live arm, joint plots, EE telemetry, pick/place targets, non-blocking Qt + ROS) | ✅ |
 | Pick-and-place sequence | ✅ |
 | Package hygiene (ament packages, launch file, README) | ✅ |
+| Stretch: second control mode, a PID trajectory-tracking loop on simulated dynamics with a live error plot (`control_mode:=pid`) | ✅ |
 | Stretch: ROS 2 action for pick-and-place with feedback and cancel | ✅ |
-| Stretch: tests (29 pytest unit tests) | ✅ |
+| Stretch: tests (35 pytest unit tests) | ✅ |
 
 The design note and the written sim-to-real answer (Part 2) are in
 [docs/DESIGN.md](docs/DESIGN.md).
@@ -42,6 +43,9 @@ source install/setup.bash
 
 # run controller + pick-and-place sequencer + GUI
 ros2 launch planar_arm_control bringup.launch.py
+
+# ...or with the PID trajectory-tracking control mode
+ros2 launch planar_arm_control bringup.launch.py control_mode:=pid
 ```
 
 > On WSLg, if the window appears blank, run `export QT_X11_NO_MITSHM=1` before launching.
@@ -66,6 +70,45 @@ ros2 action send_goal /pick_place planar_arm_interfaces/action/PickPlace \
 ros2 service call /move_to_target planar_arm_interfaces/srv/MoveToTarget "{x: 7.0, y: 3.0}"
 # -> success: true, projected: true, goal_x: 5.974, goal_y: 2.560
 ```
+
+---
+
+## Control modes
+
+The mode is selected with the `control_mode` parameter or launch argument. Both
+modes use the same planner and quintic reference trajectory; only the backend
+behind the `ArmBackend` interface changes.
+
+| `control_mode` | What runs | Hardware equivalent |
+|---|---|---|
+| `position` (default) | An ideal position servo: the measured state equals the reference. | Dynamixel in position mode, where the servo closes its own loop |
+| `pid` | A host-side PID computes joint **torques** at 50 Hz and drives a simulated plant with inertia, viscous friction, **gravity** (the arm moves in a vertical plane), torque saturation and hard joint stops. | Dynamixel in current (torque) control mode, with the loop on the host |
+
+**PID law:** τ = J·q̈_ref + Kp·e + Ki·∫e + Kd·(q̇_ref − q̇)
+
+- **Acceleration feed-forward** comes from the quintic trajectory.
+- **Gravity is not fed forward.** It is treated as an unmodelled load (an
+  unknown payload), so the **integral term** has to reject it.
+- **Gains come from pole placement on each joint's inertia:** Kp = J·ω²,
+  Kd = 2ζω·J, Ki = Kp·ω·r. The defaults are ω = 10 rad/s, ζ = 1, r = 0.3. The
+  stability bound at a 50 Hz control rate is roughly ω·Ts ≲ 0.3.
+- **Anti-windup:** the integrator is clamped, and frozen while the output is
+  saturated.
+- **A move counts as done only when the joints have settled.** The trajectory
+  must have ended *and* the error must be below `settle_tolerance`
+  (0.001 rad ≈ 0.06°), like a servo's in-position flag. The controller reports
+  `SETTLING` in between. This keeps the sequencer's end-effector arrival check
+  meaningful.
+
+**Measured** on the pick-and-place scenario: the peak tracking error is
+**about 2.1°** (while accelerating against gravity), every move settles below
+0.06°, and the peak torques of [131, 96, 11] N·m stay under the limits of
+[400, 150, 30] N·m.
+
+The GUI shows a **live tracking-error plot** (e1–e3), the current error, the
+peak error over 10 s, the applied torques, and a dashed **reference "ghost"
+arm** whenever the measured arm lags the reference. All controller output is
+also published on `/tracking_error`.
 
 ---
 
@@ -98,8 +141,9 @@ ros2 service call /move_to_target planar_arm_interfaces/srv/MoveToTarget "{x: 7.
 
 | Name | Type | Direction | Notes |
 |---|---|---|---|
-| `/joint_states` | `sensor_msgs/JointState` | controller → all | 50 Hz, position and velocity |
-| `/controller_status` | `planar_arm_interfaces/ControllerStatus` | controller → all | 10 Hz. IDLE/MOVING, progress, goal, `projected`, message, `command_id` |
+| `/joint_states` | `sensor_msgs/JointState` | controller → all | 50 Hz, measured position and velocity (plus effort in pid mode) |
+| `/tracking_error` | `planar_arm_interfaces/TrackingError` | controller → all | 50 Hz: reference, measured, error, effort |
+| `/controller_status` | `planar_arm_interfaces/ControllerStatus` | controller → all | 10 Hz. IDLE/MOVING/SETTLING, control mode, progress, goal, `projected`, message, `command_id` |
 | `/move_to_target` | `planar_arm_interfaces/srv/MoveToTarget` | → controller | `x, y, duration` (0 = auto). Returns success, projected, goal, joint goal, duration, message, `command_id` |
 | `/stop` | `std_srvs/Trigger` | → controller | Smooth deceleration to rest |
 | `/pick_place` | `planar_arm_interfaces/action/PickPlace` | → sequencer | Feedback: phase, step k/N, holding. Result: success, message, elapsed, holding |
@@ -122,6 +166,12 @@ interfaces.
 | `initial_joint_positions` | [π/2, 0, 0] | Start pose (arm straight up) |
 | `joint_names` | [joint1, joint2, joint3] | Names in `JointState` |
 | `backend` | `sim` | Hardware backend, see `backends.py` |
+| `control_mode` | `position` | `position` (ideal servo) or `pid` (torque PID on simulated dynamics) |
+| `pid_bandwidth` | 10.0 rad/s | Closed-loop natural frequency ω used to derive the gains |
+| `pid_damping` | 1.0 | Damping ratio ζ |
+| `pid_integral_ratio` | 0.3 | Ki = Kp·ω·ratio |
+| `settle_tolerance` | 0.001 rad | Max joint error for a move to count as done |
+| `settle_timeout` | 2.0 s | Stop waiting for settling after this (logged as a warning) |
 
 **pick_place_node**
 
@@ -133,9 +183,11 @@ interfaces.
 | `arrival_tolerance` | 0.01 | Max end-effector error accepted after each move |
 
 Launch arguments: `publish_rate_hz`, `max_joint_velocity`,
-`max_joint_acceleration`, `min_duration`, `backend`, `approach_offset`, e.g.
+`max_joint_acceleration`, `min_duration`, `backend`, `control_mode`,
+`pid_bandwidth`, `approach_offset`, e.g.
 
 ```bash
+ros2 launch planar_arm_control bringup.launch.py control_mode:=pid pid_bandwidth:=8.0
 ros2 launch planar_arm_control bringup.launch.py publish_rate_hz:=100.0 approach_offset:=0.0
 ```
 
@@ -156,6 +208,7 @@ ros2 topic echo /controller_status
 src/
 ├── planar_arm_interfaces/              ament_cmake: interface definitions
 │   ├── msg/ControllerStatus.msg
+│   ├── msg/TrackingError.msg
 │   ├── srv/MoveToTarget.srv
 │   └── action/PickPlace.action
 └── planar_arm_control/                 ament_python
@@ -164,7 +217,8 @@ src/
     │   ├── planar_arm.py               PROVIDED kinematics (unmodified)
     │   ├── trajectory.py               quintic + segmented trajectories       (no ROS)
     │   ├── planner.py                  IK validation, path checks, stop plan  (no ROS)
-    │   ├── backends.py                 ArmBackend interface + SimulatedBackend (no ROS)
+    │   ├── backends.py                 ArmBackend interface, position + pid backends (no ROS)
+    │   ├── control.py                  JointPid + ArmDynamics plant model     (no ROS)
     │   ├── sequence.py                 pick-and-place step list + validation  (no ROS)
     │   ├── telemetry.py                thread-safe joint-state ring buffer    (no ROS)
     │   ├── controller_node.py          controller ROS node
@@ -216,7 +270,7 @@ Each point is covered in more depth in [docs/DESIGN.md](docs/DESIGN.md).
 ## Tests
 
 ```bash
-python3 -m pytest src/planar_arm_control/test -q      # 29 passed
+python3 -m pytest src/planar_arm_control/test -q      # 35 passed
 ```
 
 | File | Covers |
@@ -225,9 +279,11 @@ python3 -m pytest src/planar_arm_control/test -q      # 29 passed
 | `test_planner.py` | the test scenario (4,2) → (−3,3), (7,3) projection, below-ground rejection, mid-motion retargeting continuity, duration stretching, smooth stop, via-pose rerouting over 300 random pose pairs |
 | `test_sequence.py` | 8-step and 4-step sequences, approach skipped near the reach boundary, invalid targets rejected |
 | `test_telemetry.py` | windowing, rate and age estimates, concurrent append and snapshot |
+| `test_control.py` | gravity-torque signs, hard stops, the integral term rejecting gravity while holding, PID tracking of the scenario moves (peak error < 3°, settles < 0.001 rad, torques within limits), backend selection |
 
 The full system was also exercised headless (GUI offscreen) against the
-running nodes: the test scenario, cancel, an unreachable pick, and pre-emption.
+running nodes, in both control modes: the test scenario, cancel, an
+unreachable pick, and pre-emption.
 
 ---
 
@@ -254,8 +310,10 @@ The file is **unmodified**. Three behaviours worth flagging, all handled in
 - **Python GIL.** The control loop and the planner run on separate executor
   threads, but they share the GIL, so a long IK call can delay a control tick by
   a few ms. Measured steady-state jitter is about 0.75 ms (std).
-- **Simulated gripper and ideal servos.** The `sim` backend tracks commands
-  perfectly, and the gripper is a boolean.
+- **Simplified dynamics.** In `position` mode the servos are ideal. In `pid`
+  mode each joint has a constant effective inertia, so the real
+  configuration-dependent, coupled mass matrix M(q) is not modelled and there
+  is no motor or sensor noise. The gripper is a boolean.
 - **Step completion is detected from `/controller_status` at 10 Hz,** which adds
   up to about 0.1 s per sequence step.
 - **One pick-and-place goal at a time.** New goals are rejected while one runs.
